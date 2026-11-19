@@ -56,8 +56,8 @@ CORS(
     resources={
         r"/api/*": {
             "origins": [
-                "http://localhost:5173",
-                "http://127.0.0.1:5173",
+                r"http://localhost:\d+",
+                r"http://127\.0\.0\.1:\d+",
             ]
         }
     },
