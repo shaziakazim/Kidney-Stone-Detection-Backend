@@ -1,0 +1,11 @@
+﻿[
+    "brain_ct",
+    "chest_ct",
+    "kidney_ct",
+    "mri",
+    "nonmedical",
+    "normal_human",
+    "other_body_ct",
+    "ultrasound",
+    "xray"
+]

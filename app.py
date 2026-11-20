@@ -1,6 +1,7 @@
 
 import os
 import io
+import json
 import base64
 import traceback
 
@@ -8,27 +9,38 @@ import cv2
 import numpy as np
 import torch
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from ultralytics import YOLO
+from torchvision import models, transforms
 
 from scipy.spatial.distance import pdist
 from segment_anything import sam_model_registry, SamPredictor
 
 
 # =========================================================
-# PATHS AND CONFIGURATION
+# 1. PATHS AND CONFIGURATION
 # =========================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+MODELS_DIR = os.path.join(BASE_DIR, "models")
+
 YOLO_MODEL_PATH = os.path.join(
-    BASE_DIR, "models", "epoch71.pt"
+    MODELS_DIR, "epoch71.pt"
 )
 
 SAM_CHECKPOINT_PATH = os.path.join(
-    BASE_DIR, "models", "sam_vit_b_01ec64.pth"
+    MODELS_DIR, "sam_vit_b_01ec64.pth"
+)
+
+GATEKEEPER_MODEL_PATH = os.path.join(
+    MODELS_DIR, "MobileNet_Gatekeeper.pth"
+)
+
+CLASS_NAMES_PATH = os.path.join(
+    MODELS_DIR, "class_names.json"
 )
 
 SAM_MODEL_TYPE = "vit_b"
@@ -37,14 +49,47 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 CONFIDENCE_THRESHOLD = 0.25
 
+GATEKEEPER_THRESHOLD = 0.60
+
+GATEKEEPER_IMAGE_SIZE = 224
+
 MAX_IMAGE_SIZE = 10 * 1024 * 1024
 
-# Estimated pixel spacing
 PIXEL_SPACING_MM = 0.75
+
+GATEKEEPER_CLASSES = [
+    "brain_ct",
+    "chest_ct",
+    "kidney_ct",
+    "mri",
+    "nonmedical",
+    "normal_human",
+    "other_body_ct",
+    "ultrasound",
+    "xray"
+]
 
 
 # =========================================================
-# FLASK APPLICATION
+# 2. MOBILENET PREPROCESSING
+# =========================================================
+
+GATEKEEPER_TRANSFORM = transforms.Compose([
+    transforms.Resize(
+        (GATEKEEPER_IMAGE_SIZE, GATEKEEPER_IMAGE_SIZE)
+    ),
+
+    transforms.ToTensor(),
+
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+])
+
+
+# =========================================================
+# 3. FLASK APPLICATION
 # =========================================================
 
 app = Flask(__name__)
@@ -65,15 +110,96 @@ CORS(
 
 
 # =========================================================
-# LOAD YOLO MODEL
+# 4. LOAD MOBILENET GATEKEEPER
+# =========================================================
+
+print("Loading MobileNetV3 Gatekeeper...")
+
+if not os.path.exists(GATEKEEPER_MODEL_PATH):
+    raise FileNotFoundError(
+        f"Gatekeeper model not found: {GATEKEEPER_MODEL_PATH}"
+    )
+
+if not os.path.exists(CLASS_NAMES_PATH):
+    raise FileNotFoundError(
+        f"Class names file not found: {CLASS_NAMES_PATH}"
+    )
+
+
+with open(
+    CLASS_NAMES_PATH,
+    "r",
+    encoding="utf-8-sig"
+) as file:
+
+    loaded_classes = json.load(file)
+
+
+if loaded_classes != GATEKEEPER_CLASSES:
+
+    raise ValueError(
+        "class_names.json does not match the expected "
+        "MobileNet class order. Check train_ds.classes "
+        "and the saved model's training configuration."
+    )
+
+
+gatekeeper_model = models.mobilenet_v3_large(
+    weights=None
+)
+
+in_features = gatekeeper_model.classifier[3].in_features
+
+gatekeeper_model.classifier[3] = torch.nn.Linear(
+    in_features,
+    len(GATEKEEPER_CLASSES)
+)
+
+
+try:
+
+    checkpoint = torch.load(
+        GATEKEEPER_MODEL_PATH,
+        map_location=DEVICE,
+        weights_only=True
+    )
+
+except TypeError:
+
+    checkpoint = torch.load(
+        GATEKEEPER_MODEL_PATH,
+        map_location=DEVICE
+    )
+
+
+if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+    checkpoint = checkpoint["state_dict"]
+
+
+gatekeeper_model.load_state_dict(
+    checkpoint,
+    strict=True
+)
+
+gatekeeper_model.to(DEVICE)
+
+gatekeeper_model.eval()
+
+print("MobileNetV3 Gatekeeper loaded successfully.")
+
+
+# =========================================================
+# 5. LOAD YOLO MODEL
 # =========================================================
 
 print("Loading YOLOv11 model...")
 
 if not os.path.exists(YOLO_MODEL_PATH):
+
     raise FileNotFoundError(
         f"YOLO model not found: {YOLO_MODEL_PATH}"
     )
+
 
 yolo_model = YOLO(YOLO_MODEL_PATH)
 
@@ -81,31 +207,99 @@ print("YOLOv11 model loaded successfully.")
 
 
 # =========================================================
-# LOAD ORIGINAL SAM MODEL
+# 6. LOAD ORIGINAL SAM MODEL
 # =========================================================
 
 print(f"Loading Original SAM ViT-B on {DEVICE}...")
 
 if not os.path.exists(SAM_CHECKPOINT_PATH):
+
     raise FileNotFoundError(
         f"SAM checkpoint not found: {SAM_CHECKPOINT_PATH}"
     )
+
 
 sam_model = sam_model_registry[SAM_MODEL_TYPE](
     checkpoint=SAM_CHECKPOINT_PATH
 )
 
 sam_model.to(device=DEVICE)
+
 sam_model.eval()
 
 sam_predictor = SamPredictor(sam_model)
 
 print("Original SAM loaded successfully.")
+
 print(f"All models ready. Device: {DEVICE}")
 
 
 # =========================================================
-# IMAGE CONVERSION
+# 7. MOBILENET GATEKEEPER PREDICTION
+# =========================================================
+
+def verify_kidney_ct(image):
+
+    image_tensor = GATEKEEPER_TRANSFORM(image)
+
+    image_tensor = image_tensor.unsqueeze(0).to(DEVICE)
+
+    with torch.no_grad():
+
+        outputs = gatekeeper_model(image_tensor)
+
+        probabilities = torch.softmax(
+            outputs,
+            dim=1
+        )
+
+        confidence, predicted_index = torch.max(
+            probabilities,
+            dim=1
+        )
+
+    predicted_index = int(predicted_index.item())
+
+    predicted_class = GATEKEEPER_CLASSES[predicted_index]
+
+    predicted_probability = float(confidence.item())
+
+    kidney_index = GATEKEEPER_CLASSES.index(
+        "kidney_ct"
+    )
+
+    kidney_probability = float(
+        probabilities[0][kidney_index].item()
+    )
+
+    accepted = (
+        predicted_class == "kidney_ct"
+        and kidney_probability >= GATEKEEPER_THRESHOLD
+    )
+
+    return {
+
+        "accepted": accepted,
+
+        "predicted_class": predicted_class,
+
+        "confidence": round(
+            predicted_probability * 100,
+            2
+        ),
+
+        "kidney_ct_probability": round(
+            kidney_probability * 100,
+            2
+        ),
+
+        "threshold": GATEKEEPER_THRESHOLD * 100
+
+    }
+
+
+# =========================================================
+# 8. IMAGE CONVERSION
 # =========================================================
 
 def image_to_data_uri(image_array):
@@ -116,7 +310,10 @@ def image_to_data_uri(image_array):
 
     buffer = io.BytesIO()
 
-    image.save(buffer, format="PNG")
+    image.save(
+        buffer,
+        format="PNG"
+    )
 
     encoded = base64.b64encode(
         buffer.getvalue()
@@ -126,7 +323,7 @@ def image_to_data_uri(image_array):
 
 
 # =========================================================
-# BOX VALIDATION
+# 9. BOX VALIDATION
 # =========================================================
 
 def clamp_box(box, image_width, image_height):
@@ -134,12 +331,15 @@ def clamp_box(box, image_width, image_height):
     x1, y1, x2, y2 = map(float, box)
 
     x1 = max(0, min(x1, image_width - 1))
+
     y1 = max(0, min(y1, image_height - 1))
 
     x2 = max(0, min(x2, image_width - 1))
+
     y2 = max(0, min(y2, image_height - 1))
 
     if x2 <= x1 or y2 <= y1:
+
         return None
 
     return np.array(
@@ -149,7 +349,7 @@ def clamp_box(box, image_width, image_height):
 
 
 # =========================================================
-# ORIGINAL SAM SEGMENTATION
+# 10. ORIGINAL SAM SEGMENTATION
 # =========================================================
 
 def sam_segment(image_array, box):
@@ -174,42 +374,50 @@ def sam_segment(image_array, box):
 
 
 # =========================================================
-# MEASURE SEGMENTATION MASK
+# 11. MEASURE SEGMENTATION MASK
 # =========================================================
 
 def measure_mask(mask):
 
-    y_coordinates, x_coordinates = np.where(mask > 0)
+    y_coordinates, x_coordinates = np.where(
+        mask > 0
+    )
 
     if len(x_coordinates) == 0:
 
         return {
+
             "area_px": 0,
+
             "width_px": None,
+
             "height_px": None,
+
             "max_distance_px": 0,
+
             "estimated_size_mm": 0
+
         }
 
     x_min = int(x_coordinates.min())
+
     x_max = int(x_coordinates.max())
 
     y_min = int(y_coordinates.min())
+
     y_max = int(y_coordinates.max())
 
     width = x_max - x_min + 1
+
     height = y_max - y_min + 1
 
     area = int(np.count_nonzero(mask))
 
-    # Coordinates of segmented pixels
     points = np.column_stack((
         x_coordinates,
         y_coordinates
     )).astype(np.float32)
 
-    # Convex hull reduces the number of points
-    # while preserving the maximum distance.
     hull = cv2.convexHull(points)
 
     hull_points = hull.reshape(-1, 2)
@@ -221,28 +429,36 @@ def measure_mask(mask):
         )
 
     else:
+
         max_distance = 0.0
 
-    # Convert pixels into estimated millimeters
     estimated_size_mm = (
         max_distance * PIXEL_SPACING_MM
     )
 
     return {
+
         "area_px": area,
+
         "width_px": int(width),
+
         "height_px": int(height),
+
         "max_distance_px": round(
-            max_distance, 2
+            max_distance,
+            2
         ),
+
         "estimated_size_mm": round(
-            estimated_size_mm, 2
+            estimated_size_mm,
+            2
         )
+
     }
 
 
 # =========================================================
-# DRAW YOLO OUTPUT IMAGES
+# 12. DRAW YOLO OUTPUT IMAGES
 # =========================================================
 
 def draw_yolo_images(image_array, detections):
@@ -256,6 +472,7 @@ def draw_yolo_images(image_array, detections):
     )
 
     plain_draw = ImageDraw.Draw(plain_image)
+
     labeled_draw = ImageDraw.Draw(labeled_image)
 
     for detection in detections:
@@ -286,7 +503,10 @@ def draw_yolo_images(image_array, detections):
             f'{detection["confidence"]:.2f}%'
         )
 
-        text_y = max(0, int(y1) - 20)
+        text_y = max(
+            0,
+            int(y1) - 20
+        )
 
         labeled_draw.text(
             (int(x1), text_y),
@@ -301,10 +521,13 @@ def draw_yolo_images(image_array, detections):
 
 
 # =========================================================
-# SEGMENTATION OVERLAY
+# 13. SEGMENTATION OVERLAY
 # =========================================================
 
-def make_segmentation_overlay(image_array, combined_mask):
+def make_segmentation_overlay(
+    image_array,
+    combined_mask
+):
 
     overlay = image_array.copy()
 
@@ -345,7 +568,7 @@ def make_segmentation_overlay(image_array, combined_mask):
 
 
 # =========================================================
-# SEGMENTATION IMAGE WITH ESTIMATED SIZE LABELS
+# 14. SEGMENTATION IMAGE WITH SIZE LABELS
 # =========================================================
 
 def make_size_labeled_image(
@@ -354,7 +577,6 @@ def make_size_labeled_image(
     combined_mask
 ):
 
-    # Start with segmentation overlay
     output = make_segmentation_overlay(
         image_array,
         combined_mask
@@ -365,11 +587,14 @@ def make_size_labeled_image(
     draw = ImageDraw.Draw(output_image)
 
     try:
+
         font = ImageFont.truetype(
             "arial.ttf",
             20
         )
+
     except OSError:
+
         font = ImageFont.load_default()
 
     for index, detection in enumerate(detections):
@@ -377,17 +602,16 @@ def make_size_labeled_image(
         dimensions = detection["dimensions"]
 
         if dimensions["area_px"] == 0:
+
             continue
 
         x1, y1, x2, y2 = detection["box"]
 
-        max_distance = dimensions["max_distance_px"]
-
         size_mm = dimensions["estimated_size_mm"]
 
         label = (
-            f'Stone {index + 1}: '
-            f'{size_mm:.2f} mm'
+            f"Stone {index + 1}: "
+            f"{size_mm:.2f} mm"
         )
 
         text_x = int(x1)
@@ -424,35 +648,49 @@ def make_size_labeled_image(
 
 
 # =========================================================
-# HOME ROUTE
+# 15. HOME ROUTE
 # =========================================================
 
 @app.route("/", methods=["GET"])
 def home():
 
     return jsonify({
+
         "message": "Kidney Stone Detection API is running.",
+
         "device": DEVICE,
+
     })
 
 
 # =========================================================
-# HEALTH CHECK
+# 16. HEALTH CHECK
 # =========================================================
 
 @app.route("/api/health", methods=["GET"])
 def health():
 
     return jsonify({
+
         "status": "success",
+
+        "gatekeeper_loaded": gatekeeper_model is not None,
+
         "yolo_loaded": yolo_model is not None,
+
         "sam_loaded": sam_predictor is not None,
+
+        "gatekeeper_threshold": GATEKEEPER_THRESHOLD,
+
+        "gatekeeper_classes": GATEKEEPER_CLASSES,
+
         "device": DEVICE,
+
     })
 
 
 # =========================================================
-# PREDICTION API
+# 17. PREDICTION API
 # =========================================================
 
 @app.route("/api/predict", methods=["POST"])
@@ -460,12 +698,19 @@ def predict():
 
     try:
 
+        # ---------------------------------------------
         # CHECK UPLOADED FILE
+        # ---------------------------------------------
 
         if "file" not in request.files:
 
             return jsonify({
-                "error": "No image file received. Please upload an image."
+
+                "error": (
+                    "No image file received. "
+                    "Please upload an image."
+                )
+
             }), 400
 
         uploaded_file = request.files["file"]
@@ -473,14 +718,32 @@ def predict():
         if uploaded_file.filename == "":
 
             return jsonify({
+
                 "error": "No file selected."
+
             }), 400
 
+        # ---------------------------------------------
         # READ IMAGE
+        # ---------------------------------------------
 
-        pil_image = Image.open(
-            uploaded_file.stream
-        ).convert("RGB")
+        try:
+
+            pil_image = Image.open(
+                uploaded_file.stream
+            )
+
+            pil_image = ImageOps.exif_transpose(
+                pil_image
+            ).convert("RGB")
+
+        except Exception:
+
+            return jsonify({
+
+                "error": "Invalid or unsupported image file."
+
+            }), 400
 
         image_array = np.array(
             pil_image,
@@ -489,9 +752,90 @@ def predict():
 
         image_height, image_width = image_array.shape[:2]
 
+        # ---------------------------------------------
+        # STEP 1: MOBILENET GATEKEEPER
+        # ---------------------------------------------
+
+        print("Running MobileNet Gatekeeper...")
+
+        gatekeeper_result = verify_kidney_ct(
+            pil_image
+        )
+
+        print(
+            "Gatekeeper Result:",
+            gatekeeper_result
+        )
+
+        # ---------------------------------------------
+        # STEP 2: REJECT NON-KIDNEY CT
+        # ---------------------------------------------
+
+        if not gatekeeper_result["accepted"]:
+
+            print("Image rejected by Gatekeeper.")
+
+            return jsonify({
+
+                "accepted": False,
+
+                "gatekeeper": gatekeeper_result,
+
+                "detected": False,
+
+                "no_stone_detected": False,
+
+                "detection_count": 0,
+
+                "detections": [],
+
+                "device": DEVICE,
+
+                "message": (
+                    "Image rejected by MobileNet Gatekeeper. "
+                    "Only kidney_ct images with at least "
+                    "60% kidney_ct probability are accepted."
+                ),
+
+                "image": {
+
+                    "filename": uploaded_file.filename,
+
+                    "format": "PNG/JPG",
+
+                    "width": image_width,
+
+                    "height": image_height,
+
+                },
+
+                "original_image": image_to_data_uri(
+                    image_array
+                ),
+
+                "yolo_image": None,
+
+                "yolo_labeled_image": None,
+
+                "segmentation_image": None,
+
+                "segmentation_size_image": None
+
+            }), 200
+
+        # ---------------------------------------------
+        # STEP 3: ACCEPTED KIDNEY CT
+        # ---------------------------------------------
+
+        print(
+            "Kidney CT accepted by Gatekeeper."
+        )
+
         print("Running YOLOv11 detection...")
 
-        # YOLO PREDICTION
+        # ---------------------------------------------
+        # STEP 4: YOLO PREDICTION
+        # ---------------------------------------------
 
         yolo_results = yolo_model.predict(
             source=image_array,
@@ -525,6 +869,7 @@ def predict():
                     )
 
                     if valid_box is None:
+
                         continue
 
                     class_id = int(
@@ -557,29 +902,43 @@ def predict():
                         ),
 
                         "dimensions": {
+
                             "area_px": 0,
+
                             "width_px": None,
+
                             "height_px": None,
+
                             "max_distance_px": 0,
+
                             "estimated_size_mm": 0
+
                         },
 
                         "sam_score": None,
 
                     })
 
-        print(f"YOLO detections: {len(detections)}")
+        print(
+            f"YOLO detections: {len(detections)}"
+        )
 
-        # YOLO OUTPUT IMAGES
+        # ---------------------------------------------
+        # STEP 5: YOLO OUTPUT IMAGES
+        # ---------------------------------------------
 
         yolo_image, yolo_labeled_image = draw_yolo_images(
             image_array,
             detections,
         )
 
-        # ORIGINAL SAM SEGMENTATION
+        # ---------------------------------------------
+        # STEP 6: ORIGINAL SAM SEGMENTATION
+        # ---------------------------------------------
 
-        print("Running Original SAM segmentation...")
+        print(
+            "Running Original SAM segmentation..."
+        )
 
         combined_mask = np.zeros(
             (image_height, image_width),
@@ -619,7 +978,6 @@ def predict():
                     4
                 )
 
-                # Calculate each stone's dimensions
                 detection["dimensions"] = measure_mask(
                     mask
                 )
@@ -629,22 +987,30 @@ def predict():
                     mask
                 )
 
-        print("YOLO + Original SAM completed.")
+        print(
+            "YOLO + Original SAM completed."
+        )
 
-        # SEGMENTATION OVERLAY
+        # ---------------------------------------------
+        # STEP 7: SEGMENTATION OVERLAY
+        # ---------------------------------------------
 
         segmentation_overlay = make_segmentation_overlay(
             image_array,
             combined_mask,
         )
 
-        # TOTAL MASK MEASUREMENTS
+        # ---------------------------------------------
+        # STEP 8: TOTAL MASK MEASUREMENTS
+        # ---------------------------------------------
 
         total_dimensions = measure_mask(
             combined_mask
         )
 
-        # IMAGE WITH SIZE LABELS
+        # ---------------------------------------------
+        # STEP 9: IMAGE WITH SIZE LABELS
+        # ---------------------------------------------
 
         size_labeled_image = make_size_labeled_image(
             image_array,
@@ -654,9 +1020,15 @@ def predict():
 
         detection_count = len(detections)
 
-        # JSON RESPONSE
+        # ---------------------------------------------
+        # STEP 10: JSON RESPONSE
+        # ---------------------------------------------
 
         response_data = {
+
+            "accepted": True,
+
+            "gatekeeper": gatekeeper_result,
 
             "detected": detection_count > 0,
 
@@ -694,6 +1066,7 @@ def predict():
             },
 
             "message": (
+                "MobileNet Gatekeeper accepted the image. "
                 "YOLOv11 detection and Original SAM segmentation completed."
             ),
 
@@ -725,18 +1098,24 @@ def predict():
 
     except Exception as error:
 
-        print("Prediction error:", str(error))
+        print(
+            "Prediction error:",
+            str(error)
+        )
 
         traceback.print_exc()
 
         return jsonify({
+
             "error": str(error),
+
             "message": "Image processing failed.",
+
         }), 500
 
 
 # =========================================================
-# RUN APPLICATION
+# 18. RUN APPLICATION
 # =========================================================
 
 if __name__ == "__main__":
